@@ -74,15 +74,21 @@ impl From<SpentInfo> for FfiSpentInfo {
     }
 }
 
-/// Query statistics including actual byte counts (FFI-safe).
+/// Query statistics including actual byte counts and timing (FFI-safe).
 #[repr(C)]
 pub struct FfiQueryStats {
     /// Bytes uploaded (query data)
     pub upload_bytes: u64,
     /// Bytes downloaded (response data)
     pub download_bytes: u64,
-    /// Server processing time in milliseconds (-1 if not available)
-    pub server_time_ms: i64,
+    /// Query generation time in milliseconds
+    pub query_gen_ms: f64,
+    /// Network round-trip time in milliseconds  
+    pub network_ms: f64,
+    /// Server processing time in milliseconds
+    pub server_ms: f64,
+    /// Decryption time in milliseconds
+    pub decrypt_ms: f64,
 }
 
 /// Result of a nullifier check with statistics (FFI-safe).
@@ -310,7 +316,10 @@ pub unsafe extern "C" fn zcashlc_pir_check_nullifier_with_stats(
             stats: FfiQueryStats {
                 upload_bytes: result.stats.upload_bytes as u64,
                 download_bytes: result.stats.download_bytes as u64,
-                server_time_ms: result.stats.server_time_ms.map(|t| t as i64).unwrap_or(-1),
+                query_gen_ms: result.stats.query_gen_ms,
+                network_ms: result.stats.network_ms,
+                server_ms: result.stats.server_ms,
+                decrypt_ms: result.stats.decrypt_ms,
             },
         };
 
