@@ -789,6 +789,50 @@ typedef struct FfiPirSpentInfo {
 } FfiPirSpentInfo;
 
 /**
+ * Query statistics including actual byte counts and timing (FFI-safe).
+ */
+typedef struct FfiPirQueryStats {
+  /**
+   * Bytes uploaded (query data)
+   */
+  uint64_t upload_bytes;
+  /**
+   * Bytes downloaded (response data)
+   */
+  uint64_t download_bytes;
+  /**
+   * Query generation time in milliseconds
+   */
+  double query_gen_ms;
+  /**
+   * Network round-trip time in milliseconds
+   */
+  double network_ms;
+  /**
+   * Server processing time in milliseconds
+   */
+  double server_ms;
+  /**
+   * Decryption time in milliseconds
+   */
+  double decrypt_ms;
+} FfiPirQueryStats;
+
+/**
+ * Result of a nullifier check with statistics (FFI-safe).
+ */
+typedef struct FfiPirCheckResult {
+  /**
+   * Pointer to SpentInfo if spent, null if unspent
+   */
+  struct FfiPirSpentInfo *spent_info;
+  /**
+   * Query statistics
+   */
+  struct FfiPirQueryStats stats;
+} FfiPirCheckResult;
+
+/**
  * An array of SpentInfo results (FFI-safe).
  *
  * Each element is either a pointer to FfiSpentInfo (if spent) or null (if unspent).
@@ -3128,6 +3172,29 @@ bool zcashlc_pir_keys_ready(const struct FfiPirClientHandle *client);
  */
 struct FfiPirSpentInfo *zcashlc_pir_check_nullifier(struct FfiPirClientHandle *client,
                                                     const uint8_t *nullifier);
+
+/**
+ * Check a single nullifier via PIR and return query statistics.
+ *
+ * Returns pointer to FfiCheckResult containing spent info and actual byte counts.
+ * Caller must free result with `zcashlc_pir_free_check_result`.
+ *
+ * # Safety
+ *
+ * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
+ * - `nullifier` must be non-null and point to exactly 32 bytes
+ */
+struct FfiPirCheckResult *zcashlc_pir_check_nullifier_with_stats(struct FfiPirClientHandle *client,
+                                                                 const uint8_t *nullifier);
+
+/**
+ * Free a check result.
+ *
+ * # Safety
+ *
+ * - `result` must be a valid pointer returned by `zcashlc_pir_check_nullifier_with_stats`, or null
+ */
+void zcashlc_pir_free_check_result(struct FfiPirCheckResult *result);
 
 /**
  * Check multiple nullifiers via PIR.
