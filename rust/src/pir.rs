@@ -74,6 +74,26 @@ impl From<SpentInfo> for FfiSpentInfo {
     }
 }
 
+/// Query statistics including actual byte counts (FFI-safe).
+#[repr(C)]
+pub struct FfiQueryStats {
+    /// Bytes uploaded (query data)
+    pub upload_bytes: u64,
+    /// Bytes downloaded (response data)
+    pub download_bytes: u64,
+    /// Server processing time in milliseconds (-1 if not available)
+    pub server_time_ms: i64,
+}
+
+/// Result of a nullifier check with statistics (FFI-safe).
+#[repr(C)]
+pub struct FfiCheckResult {
+    /// Pointer to SpentInfo if spent, null if unspent
+    pub spent_info: *mut FfiSpentInfo,
+    /// Query statistics
+    pub stats: FfiQueryStats,
+}
+
 /// An array of SpentInfo results (FFI-safe).
 ///
 /// Each element is either a pointer to FfiSpentInfo (if spent) or null (if unspent).
@@ -244,6 +264,76 @@ pub unsafe extern "C" fn zcashlc_pir_check_nullifier(
     });
 
     unwrap_exc_or_null(res)
+}
+
+/// Check a single nullifier via PIR and return query statistics.
+///
+/// Returns pointer to FfiCheckResult containing spent info and actual byte counts.
+/// Caller must free result with `zcashlc_pir_free_check_result`.
+///
+/// # Safety
+///
+/// - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
+/// - `nullifier` must be non-null and point to exactly 32 bytes
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_pir_check_nullifier_with_stats(
+    client: *mut PirClientHandle,
+    nullifier: *const u8,
+) -> *mut FfiCheckResult {
+    let client = AssertUnwindSafe(client);
+
+    let res = catch_panic(|| {
+        let client = *client;
+        if client.is_null() || nullifier.is_null() {
+            return Err(anyhow!("client or nullifier is null"));
+        }
+
+        let handle = unsafe { &mut *client };
+        let nf_bytes: [u8; 32] = unsafe { slice::from_raw_parts(nullifier, 32) }
+            .try_into()
+            .context("Invalid nullifier length")?;
+
+        let nf = Nullifier::from_bytes(nf_bytes);
+
+        let result = handle
+            .client
+            .check_nullifier_with_stats(&nf)
+            .map_err(|e| anyhow!("PIR query failed: {}", e))?;
+
+        let spent_info_ptr = match result.spent_info {
+            Some(info) => Box::into_raw(Box::new(FfiSpentInfo::from(info))),
+            None => ptr::null_mut(),
+        };
+        
+        let ffi_result = FfiCheckResult {
+            spent_info: spent_info_ptr,
+            stats: FfiQueryStats {
+                upload_bytes: result.stats.upload_bytes as u64,
+                download_bytes: result.stats.download_bytes as u64,
+                server_time_ms: result.stats.server_time_ms.map(|t| t as i64).unwrap_or(-1),
+            },
+        };
+
+        Ok(Box::into_raw(Box::new(ffi_result)))
+    });
+
+    unwrap_exc_or_null(res)
+}
+
+/// Free a check result.
+///
+/// # Safety
+///
+/// - `result` must be a valid pointer returned by `zcashlc_pir_check_nullifier_with_stats`, or null
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_pir_free_check_result(result: *mut FfiCheckResult) {
+    if !result.is_null() {
+        let result = unsafe { Box::from_raw(result) };
+        // Free the inner SpentInfo if present
+        if !result.spent_info.is_null() {
+            let _ = unsafe { Box::from_raw(result.spent_info) };
+        }
+    }
 }
 
 /// Check multiple nullifiers via PIR.
