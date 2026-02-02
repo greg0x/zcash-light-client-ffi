@@ -94,7 +94,8 @@ use zip32::fingerprint::SeedFingerprint;
 
 mod derivation;
 mod ffi;
-pub mod pir;
+// pub mod pir; // Disabled - nullifier PIR dependencies not available
+pub mod txid_pir;
 mod tor;
 
 #[cfg(target_vendor = "apple")]

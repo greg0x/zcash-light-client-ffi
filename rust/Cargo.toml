@@ -13,9 +13,9 @@ build = "build.rs"
 
 [dependencies]
 
-# PIR (nullifier lookups)
-nullifier-pir = { package = "nullifier-client", path = "../../../nullifier-pir/crates/client" }
-nullifier-common = { path = "../../../nullifier-pir/crates/common" }
+# PIR (nullifier lookups) - temporarily disabled
+# nullifier-pir = { package = "nullifier-client", path = "../../../nullifier-pir/crates/client" }
+# nullifier-common = { path = "../../../nullifier-pir/crates/common" }
 
 # Zcash
 orchard = "0.11"

@@ -5,6 +5,7 @@ use std::{env, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/pir.rs");
+    println!("cargo:rerun-if-changed=src/txid_pir.rs");
     println!("cargo:rerun-if-changed=wrapper.c");
     println!("cargo:rerun-if-changed=wrapper.h");
 
