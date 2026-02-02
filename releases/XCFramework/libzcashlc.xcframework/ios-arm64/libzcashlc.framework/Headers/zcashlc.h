@@ -4,6 +4,12 @@
 #include <stdlib.h>
 
 /**
+ * Size of a complete reconstructed Orchard action for trial decryption.
+ * Layout: nullifier(32) + cmx(32) + epk(32) + enc_ciphertext(580) + out_ciphertext(80) + cv(32) = 788
+ */
+#define PIR_ACTION_SIZE 788
+
+/**
  * Specifies how a "spend max" request should be evaluated.
  */
 typedef enum FfiMaxSpendMode {
@@ -89,36 +95,11 @@ typedef enum FfiZecUsdExchange {
 } FfiZecUsdExchange;
 
 /**
- * PIR protocol selection (FFI-safe).
- *
- * Choose based on your network constraints:
- * - `Ypir` (0): Larger queries (~5.8 MB) but faster server processing
- * - `Inspire` (1): Smaller queries (~416 KB) but longer key prep
- */
-typedef enum FfiPirProtocol {
-  /**
-   * YPIR+SP protocol - larger queries, faster server
-   */
-  Ypir = 0,
-  /**
-   * InsPIRe protocol - smaller queries, slower key prep
-   */
-  Inspire = 1,
-} FfiPirProtocol;
-
-/**
  * A struct that contains a ZIP 325 Account Metadata Key.
  */
 typedef struct FfiAccountMetadataKey FfiAccountMetadataKey;
 
 typedef struct LwdConn LwdConn;
-
-/**
- * Opaque handle to a PIR client.
- *
- * This wraps the Rust BlockingNullifierPirClient for FFI use.
- */
-typedef struct FfiPirClientHandle FfiPirClientHandle;
 
 typedef struct TorRuntime TorRuntime;
 
@@ -767,108 +748,6 @@ typedef struct FfiAddress {
   char *address;
   uint8_t diversifier_index_bytes[11];
 } FfiAddress;
-
-/**
- * Information about a spent note (FFI-safe).
- *
- * Returned when a nullifier is found in the PIR database.
- */
-typedef struct FfiPirSpentInfo {
-  /**
-   * The block height where the nullifier was revealed.
-   */
-  uint32_t block_height;
-  /**
-   * The transaction index within the block.
-   */
-  uint16_t tx_index;
-  /**
-   * Padding for alignment (unused).
-   */
-  uint16_t _padding;
-} FfiPirSpentInfo;
-
-/**
- * Query statistics including actual byte counts and timing (FFI-safe).
- */
-typedef struct FfiPirQueryStats {
-  /**
-   * Bytes uploaded (query data)
-   */
-  uint64_t upload_bytes;
-  /**
-   * Bytes downloaded (response data)
-   */
-  uint64_t download_bytes;
-  /**
-   * Query generation time in milliseconds
-   */
-  double query_gen_ms;
-  /**
-   * Network round-trip time in milliseconds
-   */
-  double network_ms;
-  /**
-   * Server processing time in milliseconds
-   */
-  double server_ms;
-  /**
-   * Decryption time in milliseconds
-   */
-  double decrypt_ms;
-} FfiPirQueryStats;
-
-/**
- * Result of a nullifier check with statistics (FFI-safe).
- */
-typedef struct FfiPirCheckResult {
-  /**
-   * Pointer to SpentInfo if spent, null if unspent
-   */
-  struct FfiPirSpentInfo *spent_info;
-  /**
-   * Query statistics
-   */
-  struct FfiPirQueryStats stats;
-} FfiPirCheckResult;
-
-/**
- * An array of SpentInfo results (FFI-safe).
- *
- * Each element is either a pointer to FfiSpentInfo (if spent) or null (if unspent).
- *
- * # Safety
- *
- * - `items` must be non-null and valid for reads for `count * size_of::<*mut FfiSpentInfo>()`
- * - Each non-null item must point to a valid FfiSpentInfo
- */
-typedef struct FfiPirSpentInfoArray {
-  /**
-   * Array of nullable pointers to SpentInfo
-   */
-  struct FfiPirSpentInfo **items;
-  /**
-   * Number of items in the array
-   */
-  uintptr_t count;
-} FfiPirSpentInfoArray;
-
-/**
- * An array of 32-byte nullifiers (FFI-safe).
- *
- * Each nullifier is 32 bytes. The array contains `count` nullifiers,
- * stored contiguously as `count * 32` bytes.
- */
-typedef struct FfiPirNullifierArray {
-  /**
-   * Contiguous array of 32-byte nullifiers
-   */
-  uint8_t *data;
-  /**
-   * Number of nullifiers in the array
-   */
-  uintptr_t count;
-} FfiPirNullifierArray;
 
 /**
  * Initializes global Rust state, such as the logging infrastructure and threadpools.
@@ -3113,156 +2992,36 @@ void zcashlc_free_single_use_taddr(struct FfiSingleUseTaddr *ptr);
 void zcashlc_free_address_check_result(struct FfiAddressCheckResult *ptr);
 
 /**
- * Initialize PIR client and connect to server.
+ * Decrypt and store Orchard actions from PIR data.
  *
- * Returns opaque pointer to client state or null on error.
+ * Takes an array of pre-merged 788-byte actions (merged from compact block + PIR data
+ * by the caller) and performs trial decryption with wallet viewing keys.
  *
- * # Arguments
+ * # Action Layout (788 bytes each)
  *
- * * `server_url` - Base URL of the PIR server (e.g., "http://localhost:3001")
- * * `protocol` - PIR protocol to use (0 = YPIR, 1 = InsPIRe)
+ * | Offset | Size | Field |
+ * |--------|------|-------|
+ * | 0 | 32 | nullifier (from compact block) |
+ * | 32 | 32 | cmx (from compact block) |
+ * | 64 | 32 | ephemeral_key (from compact block) |
+ * | 96 | 580 | enc_ciphertext (52 from compact + 528 from PIR) |
+ * | 676 | 80 | out_ciphertext (from PIR) |
+ * | 756 | 32 | cv - value commitment (from PIR) |
  *
- * # Protocol Selection
+ * # Returns
  *
- * - **YPIR (0)**: ~5.8 MB queries, ~25s key prep, faster server processing
- * - **InsPIRe (1)**: ~416 KB queries, ~3s key prep, better for mobile networks
- *
- * # Safety
- *
- * - `server_url` must be a valid null-terminated UTF-8 string
- */
-struct FfiPirClientHandle *zcashlc_pir_client_create(const char *server_url,
-                                                     enum FfiPirProtocol protocol);
-
-/**
- * Precompute PIR keys (expensive operation).
- *
- * Should be called once after client creation. This operation may take
- * several seconds (~5-20s depending on hardware).
- *
- * Returns true on success, false on error.
+ * Number of notes successfully decrypted and stored (>= 0), or -1 on error.
  *
  * # Safety
  *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
+ * - `db_data` must be valid for `db_data_len` bytes
+ * - `txid` must point to 32 bytes
+ * - `actions` must point to `action_count * 788` bytes
  */
-bool zcashlc_pir_precompute_keys(struct FfiPirClientHandle *client);
-
-/**
- * Check if keys have been precomputed.
- *
- * Returns true if keys are ready for queries, false otherwise.
- *
- * # Safety
- *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
- */
-bool zcashlc_pir_keys_ready(const struct FfiPirClientHandle *client);
-
-/**
- * Check a single nullifier via PIR.
- *
- * Returns pointer to SpentInfo if the nullifier is spent, null if unspent or on error.
- * Caller must free result with `zcashlc_pir_free_spent_info`.
- *
- * # Safety
- *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
- * - `nullifier` must be non-null and point to exactly 32 bytes
- */
-struct FfiPirSpentInfo *zcashlc_pir_check_nullifier(struct FfiPirClientHandle *client,
-                                                    const uint8_t *nullifier);
-
-/**
- * Check a single nullifier via PIR and return query statistics.
- *
- * Returns pointer to FfiCheckResult containing spent info and actual byte counts.
- * Caller must free result with `zcashlc_pir_free_check_result`.
- *
- * # Safety
- *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
- * - `nullifier` must be non-null and point to exactly 32 bytes
- */
-struct FfiPirCheckResult *zcashlc_pir_check_nullifier_with_stats(struct FfiPirClientHandle *client,
-                                                                 const uint8_t *nullifier);
-
-/**
- * Free a check result.
- *
- * # Safety
- *
- * - `result` must be a valid pointer returned by `zcashlc_pir_check_nullifier_with_stats`, or null
- */
-void zcashlc_pir_free_check_result(struct FfiPirCheckResult *result);
-
-/**
- * Check multiple nullifiers via PIR.
- *
- * Returns array of SpentInfo (null entries mean unspent).
- * Caller must free result with `zcashlc_pir_free_spent_info_array`.
- *
- * # Safety
- *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`
- * - `nullifiers` must be non-null and point to `count * 32` bytes
- * - `count` must be the number of 32-byte nullifiers
- */
-struct FfiPirSpentInfoArray *zcashlc_pir_check_nullifiers(struct FfiPirClientHandle *client,
-                                                          const uint8_t *nullifiers,
-                                                          uintptr_t count);
-
-/**
- * Free PIR client.
- *
- * # Safety
- *
- * - `client` must be a valid pointer returned by `zcashlc_pir_client_create`, or null
- */
-void zcashlc_pir_client_free(struct FfiPirClientHandle *client);
-
-/**
- * Free SpentInfo.
- *
- * # Safety
- *
- * - `info` must be a valid pointer returned by `zcashlc_pir_check_nullifier`, or null
- */
-void zcashlc_pir_free_spent_info(struct FfiPirSpentInfo *info);
-
-/**
- * Free SpentInfoArray.
- *
- * # Safety
- *
- * - `array` must be a valid pointer returned by `zcashlc_pir_check_nullifiers`, or null
- */
-void zcashlc_pir_free_spent_info_array(struct FfiPirSpentInfoArray *array);
-
-/**
- * Get unspent nullifiers from the wallet database.
- *
- * Returns an array of 32-byte nullifiers for all unspent shielded notes
- * (both Sapling and Orchard) that the wallet is tracking.
- *
- * These can be passed to PIR to verify none have been double-spent.
- *
- * # Safety
- *
- * - `db_data` must be non-null and valid for reads for `db_data_len` bytes.
- *   Its contents must be a string representing a valid system path.
- * - `network_id` must be a valid network identifier (0 = testnet, 1 = mainnet).
- * - Caller must free result with `zcashlc_pir_free_nullifier_array`.
- */
-struct FfiPirNullifierArray *zcashlc_pir_get_unspent_nullifiers(const uint8_t *db_data,
-                                                                uintptr_t db_data_len,
-                                                                uint32_t network_id);
-
-/**
- * Free a nullifier array.
- *
- * # Safety
- *
- * - `array` must be a valid pointer returned by `zcashlc_pir_get_unspent_nullifiers`, or null
- */
-void zcashlc_pir_free_nullifier_array(struct FfiPirNullifierArray *array);
+int32_t zcashlc_decrypt_and_store_pir_actions(const uint8_t *db_data,
+                                              uintptr_t db_data_len,
+                                              uint32_t network_id,
+                                              const uint8_t *txid,
+                                              uint32_t _mined_height,
+                                              uintptr_t action_count,
+                                              const uint8_t *actions);
