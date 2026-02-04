@@ -4276,8 +4276,10 @@ pub unsafe extern "C" fn zcashlc_list_orchard_notes(
     db_data_len: usize,
     _network_id: u32,
 ) -> *mut ffi::BoxedSlice {
+    debug!("zcashlc_list_orchard_notes called");
     let res = catch_panic(|| {
         let db_path = unsafe { parse_db_path(db_data, db_data_len) };
+        debug!("db_path: {:?}", db_path);
 
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| anyhow!("Error opening db for note listing: {}", e))?;
@@ -4304,6 +4306,8 @@ pub unsafe extern "C" fn zcashlc_list_orchard_notes(
             .map_err(|e| anyhow!("Error executing note query: {}", e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow!("Error reading note row: {}", e))?;
+
+        debug!("Found {} orchard notes", notes.len());
 
         // Serialize: count (4) + notes (28 each)
         let mut result = Vec::with_capacity(4 + notes.len() * 28);
