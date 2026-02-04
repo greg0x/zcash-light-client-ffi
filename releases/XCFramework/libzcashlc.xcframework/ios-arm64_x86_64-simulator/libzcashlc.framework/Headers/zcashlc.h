@@ -2558,6 +2558,31 @@ struct FfiBoxedSlice *zcashlc_get_orchard_witness_at_height(const uint8_t *db_da
                                                             uint32_t checkpoint_height);
 
 /**
+ * Generates an Orchard witness using a frontier from GetTreeState.
+ *
+ * Use this when `zcashlc_get_orchard_witness_at_height` fails with TreeIncomplete error.
+ * The frontier from GetTreeState contains all the sibling hashes needed to compute
+ * witnesses for any note that existed at that height.
+ *
+ * # Parameters
+ * - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
+ * - `tree_state_len`: Length of the tree_state bytes
+ *
+ * # Serialization Format (1068 bytes total)
+ * Same as `zcashlc_get_orchard_witness_at_height`.
+ *
+ * # Safety
+ * - All pointer parameters must be non-null and valid for their specified lengths.
+ */
+struct FfiBoxedSlice *zcashlc_get_orchard_witness_with_frontier(const uint8_t *db_data,
+                                                                uintptr_t db_data_len,
+                                                                uint32_t network_id,
+                                                                uint64_t note_position,
+                                                                uint32_t checkpoint_height,
+                                                                const uint8_t *tree_state,
+                                                                uintptr_t tree_state_len);
+
+/**
  * Lists all received Orchard notes with their commitment tree positions.
  *
  * This is a helper function for the voting demo that returns all Orchard notes

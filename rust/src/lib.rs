@@ -4176,29 +4176,54 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
         // Get the witness and root from the Orchard commitment tree
         let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
             let position = Position::from(note_position);
+            debug!("Note position: {:?}, Checkpoint height: {:?}", position, checkpoint_height);
 
             // Try to get witness - returns None if checkpoint doesn't exist
             let mut witness_result = tree
                 .witness_at_checkpoint_id(position, &checkpoint_height)
                 .map_err(|e| anyhow!("Failed to get witness: {:?}", e))?;
+            debug!("First witness attempt result: {:?}", witness_result.is_some());
 
             // If checkpoint was pruned (returns None), try to reconstruct it
             if witness_result.is_none() {
+                debug!("Witness was None, attempting checkpoint reconstruction...");
                 if let Some(tree_size) = tree_size_at_checkpoint {
                     // Reconstruct checkpoint from the tree size stored in blocks table.
                     // The checkpoint position is tree_size - 1 (0-indexed).
                     let checkpoint_position = Position::from(tree_size.saturating_sub(1));
+                    debug!("Reconstructing checkpoint at position {} (tree_size={})", u64::from(checkpoint_position), tree_size);
+                    debug!("Note position {} vs checkpoint position {}", note_position, u64::from(checkpoint_position));
+
+                    if note_position > tree_size.saturating_sub(1) {
+                        debug!("WARNING: Note position {} is AFTER checkpoint position {} - witness cannot be generated!", note_position, tree_size.saturating_sub(1));
+                    }
+
                     let checkpoint = Checkpoint::at_position(checkpoint_position);
 
                     // Add the reconstructed checkpoint to the store
                     tree.store_mut()
                         .add_checkpoint(checkpoint_height, checkpoint)
                         .map_err(|e| anyhow!("Failed to add reconstructed checkpoint: {:?}", e))?;
+                    debug!("Checkpoint added successfully");
 
                     // Retry witness generation with the reconstructed checkpoint
-                    witness_result = tree
-                        .witness_at_checkpoint_id(position, &checkpoint_height)
-                        .map_err(|e| anyhow!("Failed to get witness after checkpoint reconstruction: {:?}", e))?;
+                    match tree.witness_at_checkpoint_id(position, &checkpoint_height) {
+                        Ok(result) => {
+                            debug!("Second witness attempt result: {:?}", result.is_some());
+                            witness_result = result;
+                        }
+                        Err(e) => {
+                            debug!("Second witness attempt ERROR: {:?}", e);
+                            // Check if this is a TreeIncomplete error
+                            let err_str = format!("{:?}", e);
+                            if err_str.contains("TreeIncomplete") {
+                                return Err(anyhow!(
+                                    "Tree data incomplete for this historical height. The wallet is missing shard data required to compute the witness. This can happen for older notes where sibling tree nodes were not downloaded during sync."
+                                ));
+                            }
+                            return Err(anyhow!("Failed to get witness after checkpoint reconstruction: {:?}", e));
+                        }
+                    }
                 }
             }
 
@@ -4245,6 +4270,146 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
             result.extend_from_slice(&32u32.to_le_bytes());
 
             // Path elements (32 * 32 bytes)
+            for hash in orchard_path.auth_path() {
+                result.extend_from_slice(&hash.to_bytes());
+            }
+
+            Ok::<_, anyhow::Error>(result)
+        })?;
+
+        Ok(ffi::BoxedSlice::some(result))
+    });
+    unwrap_exc_or_null(res)
+}
+
+/// Generates an Orchard witness using a frontier from GetTreeState.
+///
+/// Use this when `zcashlc_get_orchard_witness_at_height` fails with TreeIncomplete error.
+/// The frontier from GetTreeState contains all the sibling hashes needed to compute
+/// witnesses for any note that existed at that height.
+///
+/// # Parameters
+/// - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
+/// - `tree_state_len`: Length of the tree_state bytes
+///
+/// # Serialization Format (1068 bytes total)
+/// Same as `zcashlc_get_orchard_witness_at_height`.
+///
+/// # Safety
+/// - All pointer parameters must be non-null and valid for their specified lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    note_position: u64,
+    checkpoint_height: u32,
+    tree_state: *const u8,
+    tree_state_len: usize,
+) -> *mut ffi::BoxedSlice {
+    use incrementalmerkletree::{Marking, Position, Retention};
+    use zcash_client_backend::data_api::WalletCommitmentTrees;
+    use zcash_client_backend::proto::service::TreeState;
+
+    debug!(
+        "zcashlc_get_orchard_witness_with_frontier called: position={}, height={}",
+        note_position, checkpoint_height
+    );
+
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+
+        let checkpoint_height = BlockHeight::from(checkpoint_height);
+
+        // Parse the TreeState protobuf
+        let tree_state_bytes = unsafe { slice::from_raw_parts(tree_state, tree_state_len) };
+        let tree_state_proto = TreeState::decode(tree_state_bytes)
+            .map_err(|e| anyhow!("Failed to decode TreeState protobuf: {}", e))?;
+
+        debug!("Parsed TreeState at height {}", tree_state_proto.height);
+
+        // Extract the orchard frontier
+        let orchard_commitment_tree = tree_state_proto
+            .orchard_tree()
+            .map_err(|e| anyhow!("Failed to parse orchard tree from TreeState: {}", e))?;
+
+        let orchard_frontier = orchard_commitment_tree.to_frontier();
+        debug!(
+            "Extracted frontier, position: {:?}",
+            orchard_frontier.value().map(|f| f.position())
+        );
+
+        // Get the witness and root from the Orchard commitment tree
+        let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
+            let position = Position::from(note_position);
+
+            // Insert the frontier into the tree to fill in missing nodes
+            // Frontier::take() converts to Option<NonEmptyFrontier>
+            // Clone first since we're in a closure that doesn't own orchard_frontier
+            if let Some(nonempty_frontier) = orchard_frontier.clone().take() {
+                let frontier_position = nonempty_frontier.position();
+                debug!("Inserting frontier at position {:?}", frontier_position);
+                tree.insert_frontier_nodes(
+                    nonempty_frontier,
+                    Retention::Checkpoint {
+                        id: checkpoint_height,
+                        marking: Marking::None,
+                    },
+                )
+                .map_err(|e| anyhow!("Failed to insert frontier: {:?}", e))?;
+                debug!("Frontier inserted successfully");
+
+                // Also explicitly add a checkpoint entry in the store
+                // insert_frontier_nodes marks nodes but doesn't create the checkpoint entry
+                use shardtree::store::{Checkpoint, ShardStore};
+                let checkpoint = Checkpoint::at_position(frontier_position);
+                tree.store_mut()
+                    .add_checkpoint(checkpoint_height, checkpoint)
+                    .map_err(|e| anyhow!("Failed to add checkpoint after frontier: {:?}", e))?;
+                debug!("Checkpoint added at position {:?}", frontier_position);
+            }
+
+            // Now try to generate the witness
+            debug!("Attempting witness generation at position {:?} for checkpoint {:?}", position, checkpoint_height);
+            let witness_result = tree.witness_at_checkpoint_id(position, &checkpoint_height);
+            debug!("Witness result after frontier: {:?}", witness_result.as_ref().map(|o| o.is_some()));
+
+            let witness = witness_result
+                .map_err(|e| {
+                    debug!("Witness generation failed: {:?}", e);
+                    anyhow!("Failed to get witness after frontier insertion: {:?}", e)
+                })?
+                .ok_or_else(|| {
+                    debug!("Witness was None after frontier insertion");
+                    anyhow!(
+                        "No witness available at height {} for position {} even after frontier insertion",
+                        u32::from(checkpoint_height),
+                        note_position
+                    )
+                })?;
+
+            debug!("Witness generated successfully");
+
+            // Get the tree root at the checkpoint height
+            let root = tree
+                .root_at_checkpoint_id(&checkpoint_height)
+                .map_err(|e| anyhow!("Failed to get root: {:?}", e))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No root available at height {}",
+                        u32::from(checkpoint_height)
+                    )
+                })?;
+
+            // Convert to orchard's MerklePath which has known serialization
+            let orchard_path = orchard::tree::MerklePath::from(witness);
+
+            // Serialize the witness (same format as zcashlc_get_orchard_witness_at_height)
+            let mut result = Vec::with_capacity(8 + 32 + 4 + 32 * 32);
+            result.extend_from_slice(&note_position.to_le_bytes());
+            result.extend_from_slice(&root.to_bytes());
+            result.extend_from_slice(&32u32.to_le_bytes());
             for hash in orchard_path.auth_path() {
                 result.extend_from_slice(&hash.to_bytes());
             }
