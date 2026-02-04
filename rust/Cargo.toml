@@ -17,6 +17,10 @@ build = "build.rs"
 # nullifier-pir = { package = "nullifier-client", path = "../../../nullifier-pir/crates/client" }
 # nullifier-common = { path = "../../../nullifier-pir/crates/common" }
 
+# Commitment tree types (needed for checkpoint reconstruction)
+incrementalmerkletree = { version = "0.8.2", default-features = false }
+shardtree = { version = "0.6.1", features = ["legacy-api"] }
+
 # Zcash
 orchard = "0.11"
 sapling = { package = "sapling-crypto", version = "0.5", default-features = false }

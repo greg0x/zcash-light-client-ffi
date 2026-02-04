@@ -142,6 +142,38 @@ unsafe fn wallet_db(
         .map_err(|e| anyhow!("Error opening wallet database connection: {}", e))
 }
 
+/// Helper to parse FFI path data into a Path reference.
+///
+/// # Safety
+/// Same requirements as wallet_db.
+unsafe fn parse_db_path<'a>(db_data: *const u8, db_data_len: usize) -> &'a Path {
+    Path::new(OsStr::from_bytes(unsafe {
+        slice::from_raw_parts(db_data, db_data_len)
+    }))
+}
+
+/// Queries the orchard_commitment_tree_size from the blocks table at the given height.
+/// Returns None if the height isn't in the blocks table (wallet never synced that height).
+fn query_orchard_tree_size_at_height(
+    db_path: &Path,
+    height: BlockHeight,
+) -> anyhow::Result<Option<u64>> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| anyhow!("Error opening db for tree size query: {}", e))?;
+
+    let result: Result<Option<u64>, _> = conn.query_row(
+        "SELECT orchard_commitment_tree_size FROM blocks WHERE height = ?",
+        [u32::from(height)],
+        |row| row.get(0),
+    );
+
+    match result {
+        Ok(size) => Ok(size),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(anyhow!("Error querying tree size: {}", e)),
+    }
+}
+
 /// Helper method for construcing a FsBlockDb value from path data provided over the FFI.
 ///
 /// # Safety
@@ -4075,15 +4107,22 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
 /// height, which is useful for voting proposal verification where proofs must be anchored to
 /// a specific "snapshot" height.
 ///
-/// Parameters:
+/// # Checkpoint Reconstruction
+///
+/// ShardTree normally only retains the last 100 checkpoints (`PRUNING_DEPTH`). For historical
+/// heights beyond this window, this function automatically reconstructs the checkpoint from
+/// the `orchard_commitment_tree_size` stored in the wallet's `blocks` table. This allows
+/// witness generation for any height the wallet has previously synced, not just recent ones.
+///
+/// # Parameters
 /// - `note_position`: The commitment tree position of the note (obtained from wallet note data)
 /// - `checkpoint_height`: The block height to get the witness at (must be >= note's mined height)
 ///
-/// Returns a serialized witness with the following format:
-/// - 8 bytes: note position in tree (u64 LE)
-/// - 32 bytes: tree root hash at checkpoint height
-/// - 4 bytes: path length (u32 LE, always 32 for Orchard)
-/// - path_length * 32 bytes: sibling hashes from leaf to root
+/// # Serialization Format (1068 bytes total)
+/// - Bytes 0-7: note position in tree (u64 LE)
+/// - Bytes 8-39: tree root hash at checkpoint height (32 bytes)
+/// - Bytes 40-43: path length (u32 LE, always 32 for Orchard)
+/// - Bytes 44-1067: auth path sibling hashes (32 elements × 32 bytes)
 ///
 /// Returns null on error. Check `zcashlc_last_error_length()` for error details.
 ///
@@ -4103,29 +4142,66 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
     note_position: u64,
     checkpoint_height: u32,
 ) -> *mut ffi::BoxedSlice {
+    use incrementalmerkletree::Position;
+    use shardtree::store::{Checkpoint, ShardStore};
     use zcash_client_backend::data_api::WalletCommitmentTrees;
 
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
+        let db_path = unsafe { parse_db_path(db_data, db_data_len) };
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
 
         let checkpoint_height = BlockHeight::from(checkpoint_height);
 
-        // Get the witness and root from the Orchard commitment tree, serialize inside closure
-        let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
-            // Create position from u64 - the tree uses incrementalmerkletree::Position internally
-            let position = note_position.into();
+        // Query the tree size at checkpoint height BEFORE entering the tree closure.
+        // This is needed for checkpoint reconstruction if the checkpoint was pruned.
+        // ShardTree only keeps the last 100 checkpoints (PRUNING_DEPTH), but the blocks
+        // table retains orchard_commitment_tree_size for all synced heights.
+        let tree_size_at_checkpoint = query_orchard_tree_size_at_height(db_path, checkpoint_height)?;
 
-            // Get the witness (Merkle path) at the checkpoint height
-            let witness = tree
+        // Get the witness and root from the Orchard commitment tree
+        let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
+            let position = Position::from(note_position);
+
+            // Try to get witness - returns None if checkpoint doesn't exist
+            let mut witness_result = tree
                 .witness_at_checkpoint_id(position, &checkpoint_height)
-                .map_err(|e| anyhow!("Failed to get witness: {:?}", e))?
-                .ok_or_else(|| {
+                .map_err(|e| anyhow!("Failed to get witness: {:?}", e))?;
+
+            // If checkpoint was pruned (returns None), try to reconstruct it
+            if witness_result.is_none() {
+                if let Some(tree_size) = tree_size_at_checkpoint {
+                    // Reconstruct checkpoint from the tree size stored in blocks table.
+                    // The checkpoint position is tree_size - 1 (0-indexed).
+                    let checkpoint_position = Position::from(tree_size.saturating_sub(1));
+                    let checkpoint = Checkpoint::at_position(checkpoint_position);
+
+                    // Add the reconstructed checkpoint to the store
+                    tree.store_mut()
+                        .add_checkpoint(checkpoint_height, checkpoint)
+                        .map_err(|e| anyhow!("Failed to add reconstructed checkpoint: {:?}", e))?;
+
+                    // Retry witness generation with the reconstructed checkpoint
+                    witness_result = tree
+                        .witness_at_checkpoint_id(position, &checkpoint_height)
+                        .map_err(|e| anyhow!("Failed to get witness after checkpoint reconstruction: {:?}", e))?;
+                }
+            }
+
+            let witness = witness_result.ok_or_else(|| {
+                if tree_size_at_checkpoint.is_some() {
                     anyhow!(
-                        "No witness available at height {} (checkpoint may be pruned or height is before note creation)",
+                        "No witness available at height {} (note position {} may be after the checkpoint position, or tree data is incomplete)",
+                        u32::from(checkpoint_height),
+                        note_position
+                    )
+                } else {
+                    anyhow!(
+                        "Wallet does not have block data for snapshot height {}. Wallet must sync through this height first.",
                         u32::from(checkpoint_height)
                     )
-                })?;
+                }
+            })?;
 
             // Get the tree root at the checkpoint height
             let root = tree
@@ -4133,7 +4209,7 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
                 .map_err(|e| anyhow!("Failed to get root: {:?}", e))?
                 .ok_or_else(|| {
                     anyhow!(
-                        "No root available at height {} (checkpoint may be pruned)",
+                        "No root available at height {} (unexpected after checkpoint reconstruction)",
                         u32::from(checkpoint_height)
                     )
                 })?;
@@ -4154,7 +4230,7 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
             // Path length (4 bytes, little-endian) - always 32 for Orchard
             result.extend_from_slice(&32u32.to_le_bytes());
 
-            // Path elements (32 * 32 bytes) - use orchard's auth_path method
+            // Path elements (32 * 32 bytes)
             for hash in orchard_path.auth_path() {
                 result.extend_from_slice(&hash.to_bytes());
             }
