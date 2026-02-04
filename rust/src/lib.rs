@@ -158,7 +158,16 @@ fn query_orchard_tree_size_at_height(
     db_path: &Path,
     height: BlockHeight,
 ) -> anyhow::Result<Option<u64>> {
-    let conn = rusqlite::Connection::open(db_path)
+    // Strip file:// prefix if present for rusqlite
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let clean_path_str = if db_path_str.starts_with("file://") {
+        db_path_str[7..].to_string()
+    } else {
+        db_path_str
+    };
+    let clean_path = std::path::Path::new(&clean_path_str);
+
+    let conn = rusqlite::Connection::open(clean_path)
         .map_err(|e| anyhow!("Error opening db for tree size query: {}", e))?;
 
     let result: Result<Option<u64>, _> = conn.query_row(
@@ -4146,10 +4155,13 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
     use shardtree::store::{Checkpoint, ShardStore};
     use zcash_client_backend::data_api::WalletCommitmentTrees;
 
+    debug!("zcashlc_get_orchard_witness_at_height called: position={}, height={}", note_position, checkpoint_height);
     let res = catch_panic(|| {
         let network = parse_network(network_id)?;
         let db_path = unsafe { parse_db_path(db_data, db_data_len) };
+        debug!("Opening wallet db...");
         let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+        debug!("Wallet db opened successfully");
 
         let checkpoint_height = BlockHeight::from(checkpoint_height);
 
@@ -4157,7 +4169,9 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
         // This is needed for checkpoint reconstruction if the checkpoint was pruned.
         // ShardTree only keeps the last 100 checkpoints (PRUNING_DEPTH), but the blocks
         // table retains orchard_commitment_tree_size for all synced heights.
+        debug!("Querying tree size at checkpoint height...");
         let tree_size_at_checkpoint = query_orchard_tree_size_at_height(db_path, checkpoint_height)?;
+        debug!("Tree size at checkpoint: {:?}", tree_size_at_checkpoint);
 
         // Get the witness and root from the Orchard commitment tree
         let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
@@ -4281,18 +4295,30 @@ pub unsafe extern "C" fn zcashlc_list_orchard_notes(
         let db_path = unsafe { parse_db_path(db_data, db_data_len) };
         debug!("db_path: {:?}", db_path);
 
-        let conn = rusqlite::Connection::open(db_path)
+        // Strip file:// prefix if present for rusqlite
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let clean_path_str = if db_path_str.starts_with("file://") {
+            db_path_str[7..].to_string()
+        } else {
+            db_path_str
+        };
+        let clean_path = std::path::Path::new(&clean_path_str);
+        debug!("clean_path: {:?}", clean_path);
+
+        let conn = rusqlite::Connection::open(clean_path)
             .map_err(|e| anyhow!("Error opening db for note listing: {}", e))?;
+        debug!("Database connection opened successfully");
 
         // Query all Orchard notes with their positions
-        // Note: t.block can be NULL for unconfirmed transactions, so use COALESCE
+        // Note: mined_height can be NULL for unconfirmed transactions, so use COALESCE
         let mut stmt = conn.prepare(
-            "SELECT rn.id, rn.commitment_tree_position, rn.value, COALESCE(t.block, 0) AS mined_height
+            "SELECT rn.id, rn.commitment_tree_position, rn.value, COALESCE(t.mined_height, 0) AS mined_height
              FROM orchard_received_notes rn
-             JOIN transactions t ON rn.tx = t.id_tx
+             JOIN transactions t ON rn.transaction_id = t.id_tx
              WHERE rn.commitment_tree_position IS NOT NULL
              ORDER BY rn.id"
         ).map_err(|e| anyhow!("Error preparing note query: {}", e))?;
+        debug!("SQL statement prepared successfully");
 
         let notes: Vec<(i64, u64, u64, u32)> = stmt
             .query_map([], |row| {
