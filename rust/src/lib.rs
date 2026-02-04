@@ -4062,6 +4062,112 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
 }
 
 //
+// Voting Proposal Verification Demo
+//
+
+/// Gets the Orchard Merkle witness (inclusion proof) for a note at a specific checkpoint height.
+///
+/// This function retrieves:
+/// 1. The Merkle path from the note's position to the tree root
+/// 2. The tree root at the specified checkpoint height
+///
+/// This enables verifying that a note existed in the commitment tree at a specific historical
+/// height, which is useful for voting proposal verification where proofs must be anchored to
+/// a specific "snapshot" height.
+///
+/// Parameters:
+/// - `note_position`: The commitment tree position of the note (obtained from wallet note data)
+/// - `checkpoint_height`: The block height to get the witness at (must be >= note's mined height)
+///
+/// Returns a serialized witness with the following format:
+/// - 8 bytes: note position in tree (u64 LE)
+/// - 32 bytes: tree root hash at checkpoint height
+/// - 4 bytes: path length (u32 LE, always 32 for Orchard)
+/// - path_length * 32 bytes: sibling hashes from leaf to root
+///
+/// Returns null on error. Check `zcashlc_last_error_length()` for error details.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`.
+/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
+    db_data: *const u8,
+    db_data_len: usize,
+    network_id: u32,
+    note_position: u64,
+    checkpoint_height: u32,
+) -> *mut ffi::BoxedSlice {
+    use zcash_client_backend::data_api::WalletCommitmentTrees;
+
+    let res = catch_panic(|| {
+        let network = parse_network(network_id)?;
+        let mut db_data = unsafe { wallet_db(db_data, db_data_len, network)? };
+
+        let checkpoint_height = BlockHeight::from(checkpoint_height);
+
+        // Get the witness and root from the Orchard commitment tree, serialize inside closure
+        let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
+            // Create position from u64 - the tree uses incrementalmerkletree::Position internally
+            let position = note_position.into();
+
+            // Get the witness (Merkle path) at the checkpoint height
+            let witness = tree
+                .witness_at_checkpoint_id(position, &checkpoint_height)
+                .map_err(|e| anyhow!("Failed to get witness: {:?}", e))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No witness available at height {} (checkpoint may be pruned or height is before note creation)",
+                        u32::from(checkpoint_height)
+                    )
+                })?;
+
+            // Get the tree root at the checkpoint height
+            let root = tree
+                .root_at_checkpoint_id(&checkpoint_height)
+                .map_err(|e| anyhow!("Failed to get root: {:?}", e))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No root available at height {} (checkpoint may be pruned)",
+                        u32::from(checkpoint_height)
+                    )
+                })?;
+
+            // Convert to orchard's MerklePath which has known serialization
+            let orchard_path = orchard::tree::MerklePath::from(witness);
+
+            // Serialize the witness
+            // Format: position (8) + root (32) + path_len (4) + path_elements (path_len * 32)
+            let mut result = Vec::with_capacity(8 + 32 + 4 + 32 * 32);
+
+            // Position (8 bytes, little-endian)
+            result.extend_from_slice(&note_position.to_le_bytes());
+
+            // Root hash (32 bytes)
+            result.extend_from_slice(&root.to_bytes());
+
+            // Path length (4 bytes, little-endian) - always 32 for Orchard
+            result.extend_from_slice(&32u32.to_le_bytes());
+
+            // Path elements (32 * 32 bytes) - use orchard's auth_path method
+            for hash in orchard_path.auth_path() {
+                result.extend_from_slice(&hash.to_bytes());
+            }
+
+            Ok::<_, anyhow::Error>(result)
+        })?;
+
+        Ok(ffi::BoxedSlice::some(result))
+    });
+    unwrap_exc_or_null(res)
+}
+
+//
 // Utility functions
 //
 
