@@ -2513,6 +2513,84 @@ struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_check_single_use_taddr(struct
                                                                           const uint8_t *account_uuid_bytes);
 
 /**
+ * Gets the Orchard Merkle witness (inclusion proof) for a note at a specific checkpoint height.
+ *
+ * This function retrieves:
+ * 1. The Merkle path from the note's position to the tree root
+ * 2. The tree root at the specified checkpoint height
+ *
+ * This enables verifying that a note existed in the commitment tree at a specific historical
+ * height, which is useful for voting proposal verification where proofs must be anchored to
+ * a specific "snapshot" height.
+ *
+ * # Checkpoint Reconstruction
+ *
+ * ShardTree normally only retains the last 100 checkpoints (`PRUNING_DEPTH`). For historical
+ * heights beyond this window, this function automatically reconstructs the checkpoint from
+ * the `orchard_commitment_tree_size` stored in the wallet's `blocks` table. This allows
+ * witness generation for any height the wallet has previously synced, not just recent ones.
+ *
+ * # Parameters
+ * - `note_position`: The commitment tree position of the note (obtained from wallet note data)
+ * - `checkpoint_height`: The block height to get the witness at (must be >= note's mined height)
+ *
+ * # Serialization Format (1068 bytes total)
+ * - Bytes 0-7: note position in tree (u64 LE)
+ * - Bytes 8-39: tree root hash at checkpoint height (32 bytes)
+ * - Bytes 40-43: path length (u32 LE, always 32 for Orchard)
+ * - Bytes 44-1067: auth path sibling hashes (32 elements × 32 bytes)
+ *
+ * Returns null on error. Check `zcashlc_last_error_length()` for error details.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer.
+ */
+struct FfiBoxedSlice *zcashlc_get_orchard_witness_at_height(const uint8_t *db_data,
+                                                            uintptr_t db_data_len,
+                                                            uint32_t network_id,
+                                                            uint64_t note_position,
+                                                            uint32_t checkpoint_height);
+
+/**
+ * Lists all received Orchard notes with their commitment tree positions.
+ *
+ * This is a helper function for the voting demo that returns all Orchard notes
+ * the wallet has received, along with their positions in the commitment tree.
+ * This allows the demo UI to show a list of notes for selection rather than
+ * requiring manual position input.
+ *
+ * # Serialization Format (28 bytes per note)
+ * For each note:
+ * - Bytes 0-7: note_id (i64 LE)
+ * - Bytes 8-15: commitment tree position (u64 LE)
+ * - Bytes 16-23: value in zatoshis (u64 LE)
+ * - Bytes 24-27: mined height (u32 LE)
+ *
+ * The first 4 bytes of the result contain the note count (u32 LE), followed by
+ * the serialized notes.
+ *
+ * Returns null on error. Check `zcashlc_last_error_length()` for error details.
+ *
+ * # Safety
+ *
+ * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+ *   alignment of `1`. Its contents must be a string representing a valid system path in the
+ *   operating system's preferred representation.
+ * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+ * - The total size `db_data_len` must be no larger than `isize::MAX`.
+ * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer.
+ */
+struct FfiBoxedSlice *zcashlc_list_orchard_notes(const uint8_t *db_data,
+                                                 uintptr_t db_data_len,
+                                                 uint32_t _network_id);
+
+/**
  * Returns the network type and address kind for the given address string,
  * if the address is a valid Zcash address.
  *
