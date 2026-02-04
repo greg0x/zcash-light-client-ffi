@@ -4283,8 +4283,9 @@ pub unsafe extern "C" fn zcashlc_list_orchard_notes(
             .map_err(|e| anyhow!("Error opening db for note listing: {}", e))?;
 
         // Query all Orchard notes with their positions
+        // Note: t.block can be NULL for unconfirmed transactions, so use COALESCE
         let mut stmt = conn.prepare(
-            "SELECT rn.id, rn.commitment_tree_position, rn.value, t.block AS mined_height
+            "SELECT rn.id, rn.commitment_tree_position, rn.value, COALESCE(t.block, 0) AS mined_height
              FROM orchard_received_notes rn
              JOIN transactions t ON rn.tx = t.id_tx
              WHERE rn.commitment_tree_position IS NOT NULL
