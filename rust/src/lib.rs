@@ -4243,6 +4243,86 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
     unwrap_exc_or_null(res)
 }
 
+/// Lists all received Orchard notes with their commitment tree positions.
+///
+/// This is a helper function for the voting demo that returns all Orchard notes
+/// the wallet has received, along with their positions in the commitment tree.
+/// This allows the demo UI to show a list of notes for selection rather than
+/// requiring manual position input.
+///
+/// # Serialization Format (28 bytes per note)
+/// For each note:
+/// - Bytes 0-7: note_id (i64 LE)
+/// - Bytes 8-15: commitment tree position (u64 LE)
+/// - Bytes 16-23: value in zatoshis (u64 LE)
+/// - Bytes 24-27: mined height (u32 LE)
+///
+/// The first 4 bytes of the result contain the note count (u32 LE), followed by
+/// the serialized notes.
+///
+/// Returns null on error. Check `zcashlc_last_error_length()` for error details.
+///
+/// # Safety
+///
+/// - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
+///   alignment of `1`. Its contents must be a string representing a valid system path in the
+///   operating system's preferred representation.
+/// - The memory referenced by `db_data` must not be mutated for the duration of the function call.
+/// - The total size `db_data_len` must be no larger than `isize::MAX`.
+/// - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_list_orchard_notes(
+    db_data: *const u8,
+    db_data_len: usize,
+    _network_id: u32,
+) -> *mut ffi::BoxedSlice {
+    let res = catch_panic(|| {
+        let db_path = unsafe { parse_db_path(db_data, db_data_len) };
+
+        let conn = rusqlite::Connection::open(db_path)
+            .map_err(|e| anyhow!("Error opening db for note listing: {}", e))?;
+
+        // Query all Orchard notes with their positions
+        let mut stmt = conn.prepare(
+            "SELECT rn.id, rn.commitment_tree_position, rn.value, t.block AS mined_height
+             FROM orchard_received_notes rn
+             JOIN transactions t ON rn.tx = t.id_tx
+             WHERE rn.commitment_tree_position IS NOT NULL
+             ORDER BY rn.id"
+        ).map_err(|e| anyhow!("Error preparing note query: {}", e))?;
+
+        let notes: Vec<(i64, u64, u64, u32)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,           // note_id
+                    row.get::<_, u64>(1)?,           // position
+                    row.get::<_, u64>(2)?,           // value
+                    row.get::<_, u32>(3)?,           // mined_height
+                ))
+            })
+            .map_err(|e| anyhow!("Error executing note query: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("Error reading note row: {}", e))?;
+
+        // Serialize: count (4) + notes (28 each)
+        let mut result = Vec::with_capacity(4 + notes.len() * 28);
+
+        // Note count (4 bytes, little-endian)
+        result.extend_from_slice(&(notes.len() as u32).to_le_bytes());
+
+        // Each note: note_id (8) + position (8) + value (8) + mined_height (4) = 28 bytes
+        for (note_id, position, value, mined_height) in notes {
+            result.extend_from_slice(&note_id.to_le_bytes());
+            result.extend_from_slice(&position.to_le_bytes());
+            result.extend_from_slice(&value.to_le_bytes());
+            result.extend_from_slice(&mined_height.to_le_bytes());
+        }
+
+        Ok(ffi::BoxedSlice::some(result))
+    });
+    unwrap_exc_or_null(res)
+}
+
 //
 // Utility functions
 //
