@@ -4173,6 +4173,20 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
         let tree_size_at_checkpoint = query_orchard_tree_size_at_height(db_path, checkpoint_height)?;
         debug!("Tree size at checkpoint: {:?}", tree_size_at_checkpoint);
 
+        // Validate note position vs tree size BEFORE attempting witness generation.
+        // If note_position >= tree_size, the note did NOT exist at this height.
+        if let Some(tree_size) = tree_size_at_checkpoint {
+            if note_position >= tree_size {
+                return Err(anyhow!(
+                    "Note position {} >= tree size {} at height {}. The note was not yet in the commitment tree at this height. Try a later height.",
+                    note_position,
+                    tree_size,
+                    u32::from(checkpoint_height)
+                ));
+            }
+            debug!("Note position {} < tree size {} - note existed at this height", note_position, tree_size);
+        }
+
         // Get the witness and root from the Orchard commitment tree
         let result: Vec<u8> = db_data.with_orchard_tree_mut(|tree| {
             let position = Position::from(note_position);
@@ -4184,47 +4198,19 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_at_height(
                 .map_err(|e| anyhow!("Failed to get witness: {:?}", e))?;
             debug!("First witness attempt result: {:?}", witness_result.is_some());
 
-            // If checkpoint was pruned (returns None), try to reconstruct it
+            // If checkpoint was pruned (returns None), we need to fetch the frontier from lightwalletd.
+            // A reconstructed checkpoint using Checkpoint::at_position() only knows the tree size,
+            // not the actual tree hashes. Without the frontier hashes, any witness we compute locally
+            // will have an incorrect root because we're missing sibling data.
             if witness_result.is_none() {
-                debug!("Witness was None, attempting checkpoint reconstruction...");
-                if let Some(tree_size) = tree_size_at_checkpoint {
-                    // Reconstruct checkpoint from the tree size stored in blocks table.
-                    // The checkpoint position is tree_size - 1 (0-indexed).
-                    let checkpoint_position = Position::from(tree_size.saturating_sub(1));
-                    debug!("Reconstructing checkpoint at position {} (tree_size={})", u64::from(checkpoint_position), tree_size);
-                    debug!("Note position {} vs checkpoint position {}", note_position, u64::from(checkpoint_position));
-
-                    if note_position > tree_size.saturating_sub(1) {
-                        debug!("WARNING: Note position {} is AFTER checkpoint position {} - witness cannot be generated!", note_position, tree_size.saturating_sub(1));
-                    }
-
-                    let checkpoint = Checkpoint::at_position(checkpoint_position);
-
-                    // Add the reconstructed checkpoint to the store
-                    tree.store_mut()
-                        .add_checkpoint(checkpoint_height, checkpoint)
-                        .map_err(|e| anyhow!("Failed to add reconstructed checkpoint: {:?}", e))?;
-                    debug!("Checkpoint added successfully");
-
-                    // Retry witness generation with the reconstructed checkpoint
-                    match tree.witness_at_checkpoint_id(position, &checkpoint_height) {
-                        Ok(result) => {
-                            debug!("Second witness attempt result: {:?}", result.is_some());
-                            witness_result = result;
-                        }
-                        Err(e) => {
-                            debug!("Second witness attempt ERROR: {:?}", e);
-                            // Check if this is a TreeIncomplete error
-                            let err_str = format!("{:?}", e);
-                            if err_str.contains("TreeIncomplete") {
-                                return Err(anyhow!(
-                                    "Tree data incomplete for this historical height. The wallet is missing shard data required to compute the witness. This can happen for older notes where sibling tree nodes were not downloaded during sync."
-                                ));
-                            }
-                            return Err(anyhow!("Failed to get witness after checkpoint reconstruction: {:?}", e));
-                        }
-                    }
-                }
+                debug!("Witness was None - checkpoint was pruned. Need frontier from lightwalletd.");
+                // Return a TreeIncomplete-style error to trigger frontier fallback in Swift.
+                // This ensures we fetch the actual tree state from lightwalletd rather than
+                // trying to reconstruct with incomplete local data.
+                return Err(anyhow!(
+                    "TreeIncomplete: Checkpoint at height {} was pruned. Frontier data required from lightwalletd.",
+                    u32::from(checkpoint_height)
+                ));
             }
 
             let witness = witness_result.ok_or_else(|| {
@@ -4329,10 +4315,15 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
 
         debug!("Parsed TreeState at height {}", tree_state_proto.height);
 
-        // Extract the orchard frontier
+        // Extract the orchard frontier and compute the correct root from it
         let orchard_commitment_tree = tree_state_proto
             .orchard_tree()
             .map_err(|e| anyhow!("Failed to parse orchard tree from TreeState: {}", e))?;
+
+        // Get the correct root directly from the frontier - this is the authoritative root
+        // from lightwalletd, not the potentially incorrect root from local shardtree data
+        let frontier_root = orchard_commitment_tree.root();
+        debug!("Frontier root: {:?}", frontier_root);
 
         let orchard_frontier = orchard_commitment_tree.to_frontier();
         debug!(
@@ -4391,16 +4382,9 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
 
             debug!("Witness generated successfully");
 
-            // Get the tree root at the checkpoint height
-            let root = tree
-                .root_at_checkpoint_id(&checkpoint_height)
-                .map_err(|e| anyhow!("Failed to get root: {:?}", e))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No root available at height {}",
-                        u32::from(checkpoint_height)
-                    )
-                })?;
+            // Use the frontier_root which is the authoritative root from lightwalletd,
+            // NOT tree.root_at_checkpoint_id() which can be incorrect due to mixed local data.
+            // The frontier_root was captured from orchard_commitment_tree.root() above.
 
             // Convert to orchard's MerklePath which has known serialization
             let orchard_path = orchard::tree::MerklePath::from(witness);
@@ -4408,7 +4392,7 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
             // Serialize the witness (same format as zcashlc_get_orchard_witness_at_height)
             let mut result = Vec::with_capacity(8 + 32 + 4 + 32 * 32);
             result.extend_from_slice(&note_position.to_le_bytes());
-            result.extend_from_slice(&root.to_bytes());
+            result.extend_from_slice(&frontier_root.to_bytes());
             result.extend_from_slice(&32u32.to_le_bytes());
             for hash in orchard_path.auth_path() {
                 result.extend_from_slice(&hash.to_bytes());
