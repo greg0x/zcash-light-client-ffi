@@ -2583,6 +2583,25 @@ struct FfiBoxedSlice *zcashlc_get_orchard_witness_with_frontier(const uint8_t *d
                                                                 uintptr_t tree_state_len);
 
 /**
+ * Extracts the Orchard tree root from a TreeState protobuf.
+ *
+ * This is used to verify that a generated witness produces the correct root.
+ * The root from the witness should match the root from GetTreeState at the same height.
+ *
+ * # Parameters
+ * - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
+ * - `tree_state_len`: Length of the tree_state bytes
+ *
+ * # Returns
+ * Returns the 32-byte Orchard tree root hash, or null on error.
+ *
+ * # Safety
+ * - `tree_state` must be non-null and valid for reads for `tree_state_len` bytes.
+ */
+struct FfiBoxedSlice *zcashlc_get_orchard_tree_root_from_state(const uint8_t *tree_state,
+                                                               uintptr_t tree_state_len);
+
+/**
  * Lists all received Orchard notes with their commitment tree positions.
  *
  * This is a helper function for the voting demo that returns all Orchard notes

@@ -4422,6 +4422,46 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
     unwrap_exc_or_null(res)
 }
 
+/// Extracts the Orchard tree root from a TreeState protobuf.
+///
+/// This is used to verify that a generated witness produces the correct root.
+/// The root from the witness should match the root from GetTreeState at the same height.
+///
+/// # Parameters
+/// - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
+/// - `tree_state_len`: Length of the tree_state bytes
+///
+/// # Returns
+/// Returns the 32-byte Orchard tree root hash, or null on error.
+///
+/// # Safety
+/// - `tree_state` must be non-null and valid for reads for `tree_state_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_get_orchard_tree_root_from_state(
+    tree_state: *const u8,
+    tree_state_len: usize,
+) -> *mut ffi::BoxedSlice {
+    use zcash_client_backend::proto::service::TreeState;
+
+    let res = catch_panic(|| {
+        let tree_state_bytes = unsafe { slice::from_raw_parts(tree_state, tree_state_len) };
+        let tree_state_proto = TreeState::decode(tree_state_bytes)
+            .map_err(|e| anyhow!("Failed to decode TreeState protobuf: {}", e))?;
+
+        // Extract the orchard commitment tree and get its root
+        let orchard_commitment_tree = tree_state_proto
+            .orchard_tree()
+            .map_err(|e| anyhow!("Failed to parse orchard tree from TreeState: {}", e))?;
+
+        // The commitment tree's root is computed from the frontier
+        let root = orchard_commitment_tree.root();
+        let root_bytes = root.to_bytes();
+
+        Ok(ffi::BoxedSlice::some(root_bytes.to_vec()))
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Lists all received Orchard notes with their commitment tree positions.
 ///
 /// This is a helper function for the voting demo that returns all Orchard notes
