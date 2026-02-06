@@ -4091,11 +4091,15 @@ pub unsafe extern "C" fn zcashlc_tor_lwd_conn_check_single_use_taddr(
 /// - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
 /// - `tree_state_len`: Length of the tree_state bytes
 ///
-/// # Serialization Format (1068 bytes total)
-/// - Bytes 0-7: note position in tree (u64 LE)
-/// - Bytes 8-39: tree root hash at checkpoint height (32 bytes)
-/// - Bytes 40-43: path length (u32 LE, always 32 for Orchard)
-/// - Bytes 44-1067: auth path sibling hashes (32 elements × 32 bytes)
+/// # Serialization Format (1100 bytes total)
+/// - Bytes 0-31: note commitment (32 bytes) - the leaf value for verification
+/// - Bytes 32-39: note position in tree (u64 LE)
+/// - Bytes 40-71: tree root hash at checkpoint height (32 bytes)
+/// - Bytes 72-75: path length (u32 LE, always 32 for Orchard)
+/// - Bytes 76-1099: auth path sibling hashes (32 elements × 32 bytes)
+///
+/// The witness is self-contained: verification can recompute the root by hashing
+/// the note_commitment up the auth_path and comparing with the expected root.
 ///
 /// # Safety
 /// - All pointer parameters must be non-null and valid for their specified lengths.
@@ -4198,6 +4202,16 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
 
             debug!("Witness generated successfully");
 
+            // Get the note commitment (leaf value) from the tree
+            // This is needed for verification - the commitment is what we hash up the tree
+            let note_commitment = tree.get_marked_leaf(position)
+                .map_err(|e| anyhow!("Failed to get marked leaf: {:?}", e))?
+                .ok_or_else(|| anyhow!(
+                    "No marked leaf at position {}. The note may not be marked in the tree.",
+                    note_position
+                ))?;
+            debug!("Got note commitment for position {}", note_position);
+
             // Use the frontier_root which is the authoritative root from lightwalletd,
             // NOT tree.root_at_checkpoint_id() which can be incorrect due to mixed local data.
             // The frontier_root was captured from orchard_commitment_tree.root() above.
@@ -4205,8 +4219,11 @@ pub unsafe extern "C" fn zcashlc_get_orchard_witness_with_frontier(
             // Convert to orchard's MerklePath which has known serialization
             let orchard_path = orchard::tree::MerklePath::from(witness);
 
-            // Serialize the witness (same format as zcashlc_get_orchard_witness_at_height)
-            let mut result = Vec::with_capacity(8 + 32 + 4 + 32 * 32);
+            // Serialize the witness with note commitment for self-contained verification
+            // Format: note_commitment (32) + position (8) + root (32) + path_len (4) + auth_path (32*32)
+            // Total: 1100 bytes
+            let mut result = Vec::with_capacity(32 + 8 + 32 + 4 + 32 * 32);
+            result.extend_from_slice(&note_commitment.to_bytes());
             result.extend_from_slice(&note_position.to_le_bytes());
             result.extend_from_slice(&frontier_root.to_bytes());
             result.extend_from_slice(&32u32.to_le_bytes());
@@ -4260,6 +4277,135 @@ pub unsafe extern "C" fn zcashlc_get_orchard_tree_root_from_state(
         Ok(ffi::BoxedSlice::some(root_bytes.to_vec()))
     });
     unwrap_exc_or_null(res)
+}
+
+/// Verifies an Orchard witness by recomputing the Merkle root.
+///
+/// This simulates what the ZKP circuit does: hash the note commitment up the
+/// auth path and verify it produces the expected root.
+///
+/// # Parameters
+/// - `witness_data`: Serialized witness from `zcashlc_get_orchard_witness_with_frontier` (1100 bytes)
+/// - `witness_len`: Length of witness data
+///
+/// # Returns
+/// - 1: Witness is valid (computed root matches expected root)
+/// - 0: Witness is invalid (roots don't match)
+/// - -1: Error (check `zcashlc_last_error_length()` for details)
+///
+/// # Safety
+/// - `witness_data` must be non-null and valid for reads for `witness_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_verify_orchard_witness(
+    witness_data: *const u8,
+    witness_len: usize,
+) -> i32 {
+    use incrementalmerkletree::Hashable;
+    use orchard::tree::MerkleHashOrchard;
+
+    let res = catch_panic(|| {
+        let witness_bytes = unsafe { slice::from_raw_parts(witness_data, witness_len) };
+
+        // Expected format (1100 bytes):
+        // - note_commitment (32)
+        // - position (8)
+        // - expected_root (32)
+        // - path_len (4)
+        // - auth_path (32 * 32 = 1024)
+        if witness_bytes.len() != 1100 {
+            return Err(anyhow!(
+                "Invalid witness length: {} (expected 1100)",
+                witness_bytes.len()
+            ));
+        }
+
+        // Parse note commitment (bytes 0-31)
+        let commitment_bytes: [u8; 32] = witness_bytes[0..32]
+            .try_into()
+            .map_err(|_| anyhow!("Failed to parse note commitment"))?;
+        let note_commitment = MerkleHashOrchard::from_bytes(&commitment_bytes);
+        if note_commitment.is_none().into() {
+            return Err(anyhow!("Invalid note commitment bytes"));
+        }
+        let note_commitment = note_commitment.unwrap();
+
+        // Parse position (bytes 32-39)
+        let position = u64::from_le_bytes(
+            witness_bytes[32..40]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse position"))?,
+        );
+
+        // Parse expected root (bytes 40-71)
+        let expected_root_bytes: [u8; 32] = witness_bytes[40..72]
+            .try_into()
+            .map_err(|_| anyhow!("Failed to parse expected root"))?;
+        let expected_root = MerkleHashOrchard::from_bytes(&expected_root_bytes);
+        if expected_root.is_none().into() {
+            return Err(anyhow!("Invalid expected root bytes"));
+        }
+        let expected_root = expected_root.unwrap();
+
+        // Parse path length (bytes 72-75) - should be 32
+        let path_len = u32::from_le_bytes(
+            witness_bytes[72..76]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse path length"))?,
+        );
+        if path_len != 32 {
+            return Err(anyhow!("Invalid path length: {} (expected 32)", path_len));
+        }
+
+        // Parse auth path (bytes 76-1099)
+        let mut auth_path: [MerkleHashOrchard; 32] = [MerkleHashOrchard::empty_leaf(); 32];
+        for i in 0..32 {
+            let start = 76 + i * 32;
+            let end = start + 32;
+            let hash_bytes: [u8; 32] = witness_bytes[start..end]
+                .try_into()
+                .map_err(|_| anyhow!("Failed to parse auth path element {}", i))?;
+            let hash = MerkleHashOrchard::from_bytes(&hash_bytes);
+            if hash.is_none().into() {
+                return Err(anyhow!("Invalid auth path element {} bytes", i));
+            }
+            auth_path[i] = hash.unwrap();
+        }
+
+        // Compute the root by hashing up the tree
+        // Start with the note commitment, combine with siblings based on position
+        // The level parameter is important - Orchard uses different hash domains at each level
+        let mut current = note_commitment;
+        let mut pos = position;
+
+        for (level, sibling) in auth_path.iter().enumerate() {
+            let tree_level = incrementalmerkletree::Level::from(level as u8);
+            // If bit is 0, we're on the left, sibling is on the right
+            // If bit is 1, we're on the right, sibling is on the left
+            current = if pos & 1 == 0 {
+                MerkleHashOrchard::combine(tree_level, &current, sibling)
+            } else {
+                MerkleHashOrchard::combine(tree_level, sibling, &current)
+            };
+            pos >>= 1;
+        }
+
+        // Compare computed root with expected root
+        let is_valid = current == expected_root;
+
+        debug!(
+            "Witness verification: computed_root={:?}, expected_root={:?}, valid={}",
+            current.to_bytes(),
+            expected_root.to_bytes(),
+            is_valid
+        );
+
+        Ok(if is_valid { 1i32 } else { 0i32 })
+    });
+
+    match res {
+        Ok(result) => result,
+        Err(_) => -1,
+    }
 }
 
 /// Lists all received Orchard notes with their commitment tree positions.

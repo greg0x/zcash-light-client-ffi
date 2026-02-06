@@ -2513,63 +2513,31 @@ struct FfiAddressCheckResult *zcashlc_tor_lwd_conn_check_single_use_taddr(struct
                                                                           const uint8_t *account_uuid_bytes);
 
 /**
- * Gets the Orchard Merkle witness (inclusion proof) for a note at a specific checkpoint height.
+ * Generates an Orchard witness using a frontier from GetTreeState.
  *
- * This function retrieves:
- * 1. The Merkle path from the note's position to the tree root
- * 2. The tree root at the specified checkpoint height
+ * This function generates a Merkle witness (inclusion proof) for an Orchard note at a specific
+ * checkpoint height, using the tree frontier fetched from lightwalletd. The frontier contains
+ * all the sibling hashes needed to compute witnesses for any note that existed at that height.
  *
- * This enables verifying that a note existed in the commitment tree at a specific historical
- * height, which is useful for voting proposal verification where proofs must be anchored to
- * a specific "snapshot" height.
- *
- * # Checkpoint Reconstruction
- *
- * ShardTree normally only retains the last 100 checkpoints (`PRUNING_DEPTH`). For historical
- * heights beyond this window, this function automatically reconstructs the checkpoint from
- * the `orchard_commitment_tree_size` stored in the wallet's `blocks` table. This allows
- * witness generation for any height the wallet has previously synced, not just recent ones.
+ * **Why frontier is required:** Local wallet data only contains tree shards for notes the wallet
+ * owns. To compute a witness, we need sibling hashes that may be in shards the wallet never
+ * downloaded. Using the frontier from lightwalletd ensures we always have the correct data.
  *
  * # Parameters
  * - `note_position`: The commitment tree position of the note (obtained from wallet note data)
  * - `checkpoint_height`: The block height to get the witness at (must be >= note's mined height)
- *
- * # Serialization Format (1068 bytes total)
- * - Bytes 0-7: note position in tree (u64 LE)
- * - Bytes 8-39: tree root hash at checkpoint height (32 bytes)
- * - Bytes 40-43: path length (u32 LE, always 32 for Orchard)
- * - Bytes 44-1067: auth path sibling hashes (32 elements × 32 bytes)
- *
- * Returns null on error. Check `zcashlc_last_error_length()` for error details.
- *
- * # Safety
- *
- * - `db_data` must be non-null and valid for reads for `db_data_len` bytes, and it must have an
- *   alignment of `1`. Its contents must be a string representing a valid system path in the
- *   operating system's preferred representation.
- * - The memory referenced by `db_data` must not be mutated for the duration of the function call.
- * - The total size `db_data_len` must be no larger than `isize::MAX`.
- * - Call [`zcashlc_free_boxed_slice`] to free the memory associated with the returned pointer.
- */
-struct FfiBoxedSlice *zcashlc_get_orchard_witness_at_height(const uint8_t *db_data,
-                                                            uintptr_t db_data_len,
-                                                            uint32_t network_id,
-                                                            uint64_t note_position,
-                                                            uint32_t checkpoint_height);
-
-/**
- * Generates an Orchard witness using a frontier from GetTreeState.
- *
- * Use this when `zcashlc_get_orchard_witness_at_height` fails with TreeIncomplete error.
- * The frontier from GetTreeState contains all the sibling hashes needed to compute
- * witnesses for any note that existed at that height.
- *
- * # Parameters
  * - `tree_state`: Protobuf-encoded TreeState from lightwalletd's GetTreeState RPC
  * - `tree_state_len`: Length of the tree_state bytes
  *
- * # Serialization Format (1068 bytes total)
- * Same as `zcashlc_get_orchard_witness_at_height`.
+ * # Serialization Format (1100 bytes total)
+ * - Bytes 0-31: note commitment (32 bytes) - the leaf value for verification
+ * - Bytes 32-39: note position in tree (u64 LE)
+ * - Bytes 40-71: tree root hash at checkpoint height (32 bytes)
+ * - Bytes 72-75: path length (u32 LE, always 32 for Orchard)
+ * - Bytes 76-1099: auth path sibling hashes (32 elements × 32 bytes)
+ *
+ * The witness is self-contained: verification can recompute the root by hashing
+ * the note_commitment up the auth_path and comparing with the expected root.
  *
  * # Safety
  * - All pointer parameters must be non-null and valid for their specified lengths.
@@ -2600,6 +2568,27 @@ struct FfiBoxedSlice *zcashlc_get_orchard_witness_with_frontier(const uint8_t *d
  */
 struct FfiBoxedSlice *zcashlc_get_orchard_tree_root_from_state(const uint8_t *tree_state,
                                                                uintptr_t tree_state_len);
+
+/**
+ * Verifies an Orchard witness by recomputing the Merkle root.
+ *
+ * This simulates what the ZKP circuit does: hash the note commitment up the
+ * auth path and verify it produces the expected root.
+ *
+ * # Parameters
+ * - `witness_data`: Serialized witness from `zcashlc_get_orchard_witness_with_frontier` (1100 bytes)
+ * - `witness_len`: Length of witness data
+ *
+ * # Returns
+ * - 1: Witness is valid (computed root matches expected root)
+ * - 0: Witness is invalid (roots don't match)
+ * - -1: Error (check `zcashlc_last_error_length()` for details)
+ *
+ * # Safety
+ * - `witness_data` must be non-null and valid for reads for `witness_len` bytes.
+ */
+int32_t zcashlc_verify_orchard_witness(const uint8_t *witness_data,
+                                       uintptr_t witness_len);
 
 /**
  * Lists all received Orchard notes with their commitment tree positions.
